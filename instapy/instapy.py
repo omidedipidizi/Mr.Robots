@@ -1,15 +1,19 @@
 """OS Modules environ method to get the setup vars from the Environment"""
-from datetime import datetime
-from os import environ
-
-from random import randint
-from random import sample
+import csv
+import json
+import logging
 from math import ceil
+import os
+from datetime import datetime
+from sys import maxsize
+import random
+
 from pyvirtualdisplay import Display
 from selenium import webdriver
 from selenium.common.exceptions import NoSuchElementException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver import DesiredCapabilities
+import requests
 
 from .clarifai_util import check_image
 from .comment_util import comment_image
@@ -36,9 +40,6 @@ from .unfollow_util import follow_given_user
 from .unfollow_util import load_follow_restriction
 from .unfollow_util import dump_follow_restriction
 from .unfollow_util import set_automated_followed_pool
-import random
-import csv
-import os
 
 
 class InstaPy:
@@ -50,7 +51,8 @@ class InstaPy:
                  nogui=False,
                  selenium_local_session=True,
                  use_firefox=False,
-                 page_delay=25):
+                 page_delay=25,
+                 show_logs=True):
 
         if nogui:
             self.display = Display(visible=0, size=(800, 600))
@@ -58,10 +60,8 @@ class InstaPy:
 
         self.browser = None
 
-        self.logFile = open('./logs/logFile.txt', 'a')
-
-        self.username = username or environ.get('INSTA_USER')
-        self.password = password or environ.get('INSTA_PW')
+        self.username = username or os.environ.get('INSTA_USER')
+        self.password = password or os.environ.get('INSTA_PW')
         self.nogui = nogui
 
         self.page_delay = page_delay
@@ -85,6 +85,7 @@ class InstaPy:
         self.automatedFollowedPool = []
         self.do_like = False
         self.like_percentage = 0
+        self.smart_hashtags = []
 
         self.dont_like = ['sex', 'nsfw']
         self.ignore_if_contains = []
@@ -105,14 +106,28 @@ class InstaPy:
 
         self.aborting = False
 
+        # initialize and setup logging system
+        self.logger = logging.getLogger(__name__)
+        self.logger.setLevel(logging.DEBUG)
+        file_handler = logging.FileHandler('./logs/general.log')
+        file_handler.setLevel(logging.DEBUG)
+        logger_formatter = logging.Formatter('%(levelname)s - %(message)s')
+        file_handler.setFormatter(logger_formatter)
+        self.logger.addHandler(file_handler)
+
+        if show_logs is True:
+            console_handler = logging.StreamHandler()
+            console_handler.setLevel(logging.DEBUG)
+            console_handler.setFormatter(logger_formatter)
+            self.logger.addHandler(console_handler)
+
         if selenium_local_session:
             self.set_selenium_local_session()
 
         if os.name == 'nt':
             error_msg = ('Sorry, Record Activity is not working on Windows. '
                          'We\'re working to fix this soon!')
-            print(error_msg)
-            self.logFile.write('error_msg\n')
+            self.logger.critical(error_msg)
 
     def set_selenium_local_session(self):
         """Starts local session for a selenium server.
@@ -160,8 +175,8 @@ class InstaPy:
             self.browser = webdriver.Chrome(chromedriver_location,
                                             chrome_options=chrome_options)
         self.browser.implicitly_wait(self.page_delay)
-        self.logFile.write('Session started - %s\n'
-                           % (datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+        self.logger.info('Session started - %s'
+                         % (datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
 
         return self
 
@@ -180,8 +195,8 @@ class InstaPy:
                 command_executor=selenium_url,
                 desired_capabilities=DesiredCapabilities.CHROME)
 
-        self.logFile.write('Session started - %s\n'
-                           % (datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+        self.logger.info('Session started - %s'
+                         % (datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
 
         return self
 
@@ -191,13 +206,11 @@ class InstaPy:
                           self.username,
                           self.password,
                           self.switch_language):
-            print('Wrong login data!')
-            self.logFile.write('Wrong login data!\n')
+            self.logger.critical('Wrong login data!')
 
             self.aborting = True
         else:
-            print('Logged in successfully!')
-            self.logFile.write('Logged in successfully!\n')
+            self.logger.info('Logged in successfully!')
 
         log_follower_num(self.browser, self.username)
 
@@ -225,7 +238,7 @@ class InstaPy:
             return self
 
         if (media not in [None, 'Photo', 'Video']):
-            print('Unkown media type! Treating as "any".')
+            self.logger.warning('Unkown media type! Treating as "any".')
             media = None
 
         self.comments = comments or []
@@ -265,9 +278,8 @@ class InstaPy:
             return self
 
         if not isinstance(tags, list):
-            self.logFile.write('Unable to use your set_dont_like '
-                               'configuration!\n')
-            print ('Unable to use your set_dont_like configuration!')
+            self.logger.warning('Unable to use your set_dont_like '
+                                'configuration!')
             self.aborting = True
 
         self.dont_like = tags or []
@@ -332,12 +344,54 @@ class InstaPy:
         self.use_clarifai = enabled
 
         if api_key is None and self.clarifai_api_key is None:
-            self.clarifai_api_key = environ.get('CLARIFAI_API_KEY')
+            self.clarifai_api_key = os.environ.get('CLARIFAI_API_KEY')
         elif api_key is not None:
             self.clarifai_api_key = api_key
 
         self.clarifai_full_match = full_match
 
+        return self
+
+    def set_smart_hashtags(self,
+                           tags=None,
+                           limit=3,
+                           sort='top',
+                           log_tags=True):
+        """Generate smart hashtags based on https://displaypurposes.com/"""
+        """ranking, banned and spammy tags are filtered out."""
+
+        if tags is None:
+            print('set_smart_hashtags is misconfigured')
+            return
+
+        for tag in tags:
+            req = requests.get(
+                'https://d212rkvo8t62el.cloudfront.net/tag/{}'.format(tag))
+            data = json.loads(req.text)
+
+            if data['tagExists'] is True:
+                if sort == 'top':
+                    # sort by ranking
+                    ordered_tags_by_rank = sorted(
+                        data['results'], key=lambda d: d['rank'], reverse=True)
+                    ranked_tags = (ordered_tags_by_rank[:limit])
+                    for item in ranked_tags:
+                        # add smart hashtag to like list
+                        self.smart_hashtags.append(item['tag'])
+
+                elif sort == 'random':
+                    random_tags = random.sample(data['results'], limit)
+                    for item in random_tags:
+                        self.smart_hashtags.append(item['tag'])
+
+                if log_tags is True:
+                    for item in self.smart_hashtags:
+                        print('[smart hashtag generated: {}]'.format(item))
+            else:
+                print('Too few results for #{} tag'.format(tag))
+
+        # delete duplicated tags
+        self.smart_hashtags = list(set(self.smart_hashtags))
         return self
 
     def clarifai_check_img_for(self, tags=None, comment=False, comments=None):
@@ -368,20 +422,22 @@ class InstaPy:
                 followed += follow_given_user(self.browser,
                                               acc_to_follow,
                                               self.follow_restrict,
-                                              self.blacklist)
+                                              self.blacklist,
+                                              self.logger)
                 self.followed += followed
-                self.logFile.write('Followed: {}\n'.format(str(followed)))
+                self.logger.info('Followed: {}'.format(str(followed)))
                 followed = 0
             else:
-                print('---> {} has already been followed more than {} times'
-                      .format(acc_to_follow, str(self.follow_times)))
+                self.logger.info('---> {} has already been followed more than '
+                                 '{} times'.format(
+                                    acc_to_follow, str(self.follow_times)))
                 sleep(1)
 
         return self
 
     def set_upper_follower_count(self, limit=None):
         """Used to chose if a post is liked by the number of likes"""
-        self.like_by_followers_upper_limit = limit or 0
+        self.like_by_followers_upper_limit = limit or maxsize
         return self
 
     def set_lower_follower_count(self, limit=None):
@@ -407,28 +463,24 @@ class InstaPy:
         locations = locations or []
 
         for index, location in enumerate(locations):
-            print('Location [{}/{}]'.format(index + 1, len(locations)))
-            print('--> {}'.format(location.encode('utf-8')))
-            self.logFile.write('Location [{}/[]]'
-                               .format(index + 1, len(locations)))
-            self.logFile.write('--> {}\n'.format(location.encode('utf-8')))
+            self.logger.info('Location [{}/{}]'
+                             .format(index + 1, len(locations)))
+            self.logger.info('--> {}'.format(location.encode('utf-8')))
 
             try:
                 links = get_links_for_location(self.browser,
                                                location,
                                                amount,
+                                               self.logger,
                                                media,
                                                skip_top_posts)
             except NoSuchElementException:
-                print('Too few images, skipping this location')
-                self.logFile.write('Too few images, skipping this location\n')
-
+                self.logger.warning('Too few images, skipping this location')
                 continue
 
             for i, link in enumerate(links):
-                print('[{}/{}]'.format(i + 1, len(links)))
-                self.logFile.write('[{}/{}]'.format(i + 1, len(links)))
-                self.logFile.write(link)
+                self.logger.info('[{}/{}]'.format(i + 1, len(links)))
+                self.logger.info(link)
 
                 try:
                     inappropriate, user_name, is_video, reason = (
@@ -439,21 +491,23 @@ class InstaPy:
                                    self.ignore_users,
                                    self.username,
                                    self.like_by_followers_upper_limit,
-                                   self.like_by_followers_lower_limit)
+                                   self.like_by_followers_lower_limit,
+                                   self.logger)
                     )
 
                     if not inappropriate:
-                        liked = like_image(
-                            self.browser, user_name, self.blacklist
-                        )
+                        liked = like_image(self.browser,
+                                           user_name,
+                                           self.blacklist,
+                                           self.logger)
 
                         if liked:
                             liked_img += 1
                             checked_img = True
                             temp_comments = []
-                            commenting = randint(
+                            commenting = random.randint(
                                 0, 100) <= self.comment_percentage
-                            following = randint(
+                            following = random.randint(
                                 0, 100) <= self.follow_percentage
 
                             if self.use_clarifai and (following or commenting):
@@ -462,12 +516,12 @@ class InstaPy:
                                         check_image(self.browser,
                                                     self.clarifai_api_key,
                                                     self.clarifai_img_tags,
+                                                    self.logger,
                                                     self.clarifai_full_match)
                                     )
                                 except Exception as err:
-                                    print('Image check error: {}'.format(err))
-                                    self.logFile.write(
-                                        'Image check error: {}\n'.format(err))
+                                    self.logger.error(
+                                        'Image check error: {}'.format(err))
 
                             if (self.do_comment and
                                 user_name not in self.dont_include and
@@ -486,9 +540,10 @@ class InstaPy:
                                 commented += comment_image(self.browser,
                                                            user_name,
                                                            comments,
-                                                           self.blacklist)
+                                                           self.blacklist,
+                                                           self.logger)
                             else:
-                                print('--> Not commented')
+                                self.logger.info('--> Not commented')
                                 sleep(1)
 
                             if (self.do_follow and
@@ -502,34 +557,26 @@ class InstaPy:
                                                         self.follow_restrict,
                                                         self.username,
                                                         user_name,
-                                                        self.blacklist)
+                                                        self.blacklist,
+                                                        self.logger)
 
                             else:
-                                print('--> Not following')
+                                self.logger.info('--> Not following')
                                 sleep(1)
                         else:
                             already_liked += 1
                     else:
-                        print('--> Image not liked: {}'.format(reason))
+                        self.logger.info(
+                            '--> Image not liked: {}'.format(reason))
                         inap_img += 1
                 except NoSuchElementException as err:
-                    print('Invalid Page: {}'.format(err))
-                    self.logFile.write('Invalid Page: {}\n'.format(err))
+                    self.logger.error('Invalid Page: {}'.format(err))
 
-                print('')
-                self.logFile.write('\n')
-
-        print('Liked: {}'.format(liked_img))
-        print('Already Liked: {}'.format(already_liked))
-        print('Inappropriate: {}'.format(inap_img))
-        print('Commented: {}'.format(commented))
-        print('Followed: {}'.format(followed))
-
-        self.logFile.write('Liked: {}\n'.format(liked_img))
-        self.logFile.write('Already Liked: {}\n'.format(already_liked))
-        self.logFile.write('Inappropriate: {}\n'.format(inap_img))
-        self.logFile.write('Commented: {}\n'.format(commented))
-        self.logFile.write('Followed: {}\n'.format(followed))
+        self.logger.info('Liked: {}'.format(liked_img))
+        self.logger.info('Already Liked: {}'.format(already_liked))
+        self.logger.info('Inappropriate: {}'.format(inap_img))
+        self.logger.info('Commented: {}'.format(commented))
+        self.logger.info('Followed: {}'.format(followed))
 
         self.followed += followed
 
@@ -539,7 +586,8 @@ class InstaPy:
                      tags=None,
                      amount=50,
                      media=None,
-                     skip_top_posts=True):
+                     skip_top_posts=True,
+                     use_smart_hashtags=False):
         """Likes (default) 50 images per given tag"""
         if self.aborting:
             return self
@@ -550,32 +598,34 @@ class InstaPy:
         commented = 0
         followed = 0
 
+        # if smart hashtag is enabled
+        if use_smart_hashtags is True and self.smart_hashtags is not []:
+            print('Using smart hashtags')
+            tags = self.smart_hashtags
+
         # deletes white spaces in tags
-        tags = list(map(str.strip, tags))
+        tags = [tag.strip() for tag in tags]
 
         tags = tags or []
 
         for index, tag in enumerate(tags):
-            print('Tag [{}/{}]'.format(index + 1, len(tags)))
-            print('--> {}'.format(tag.encode('utf-8')))
-            self.logFile.write('Tag [{}/[]]'.format(index + 1, len(tags)))
-            self.logFile.write('--> {}\n'.format(tag.encode('utf-8')))
+            self.logger.info('Tag [{}/{}]'.format(index + 1, len(tags)))
+            self.logger.info('--> {}'.format(tag.encode('utf-8')))
 
             try:
                 links = get_links_for_tag(self.browser,
-                                          tag, amount,
+                                          tag,
+                                          amount,
+                                          self.logger,
                                           media,
                                           skip_top_posts)
             except NoSuchElementException:
-                print('Too few images, skipping this tag')
-                self.logFile.write('Too few images, skipping this tag\n')
-
+                self.logger.error('Too few images, skipping this tag')
                 continue
 
             for i, link in enumerate(links):
-                print('[{}/{}]'.format(i + 1, len(links)))
-                self.logFile.write('[{}/{}]'.format(i + 1, len(links)))
-                self.logFile.write(link)
+                self.logger.info('[{}/{}]'.format(i + 1, len(links)))
+                self.logger.info(link)
 
                 try:
                     inappropriate, user_name, is_video, reason = (
@@ -586,21 +636,23 @@ class InstaPy:
                                    self.ignore_users,
                                    self.username,
                                    self.like_by_followers_upper_limit,
-                                   self.like_by_followers_lower_limit)
+                                   self.like_by_followers_lower_limit,
+                                   self.logger)
                     )
 
                     if not inappropriate:
-                        liked = like_image(
-                            self.browser, user_name, self.blacklist
-                        )
+                        liked = like_image(self.browser,
+                                           user_name,
+                                           self.blacklist,
+                                           self.logger)
 
                         if liked:
                             liked_img += 1
                             checked_img = True
                             temp_comments = []
-                            commenting = (randint(0, 100) <=
+                            commenting = (random.randint(0, 100) <=
                                           self.comment_percentage)
-                            following = (randint(0, 100) <=
+                            following = (random.randint(0, 100) <=
                                          self.follow_percentage)
 
                             if self.use_clarifai and (following or commenting):
@@ -609,12 +661,12 @@ class InstaPy:
                                         check_image(self.browser,
                                                     self.clarifai_api_key,
                                                     self.clarifai_img_tags,
+                                                    self.logger,
                                                     self.clarifai_full_match)
                                     )
                                 except Exception as err:
-                                    print('Image check error: {}'.format(err))
-                                    self.logFile.write(
-                                        'Image check error: {}\n'.format(err))
+                                    self.logger.error(
+                                        'Image check error: {}'.format(err))
 
                             if (self.do_comment and
                                 user_name not in self.dont_include and
@@ -633,9 +685,10 @@ class InstaPy:
                                 commented += comment_image(self.browser,
                                                            user_name,
                                                            comments,
-                                                           self.blacklist)
+                                                           self.blacklist,
+                                                           self.logger)
                             else:
-                                print('--> Not commented')
+                                self.logger.info('--> Not commented')
                                 sleep(1)
 
                             if (self.do_follow and
@@ -649,33 +702,25 @@ class InstaPy:
                                                         self.follow_restrict,
                                                         self.username,
                                                         user_name,
-                                                        self.blacklist)
+                                                        self.blacklist,
+                                                        self.logger)
                             else:
-                                print('--> Not following')
+                                self.logger.info('--> Not following')
                                 sleep(1)
                         else:
                             already_liked += 1
                     else:
-                        print('--> Image not liked: {}'.format(reason))
+                        self.logger.info(
+                            '--> Image not liked: {}'.format(reason))
                         inap_img += 1
                 except NoSuchElementException as err:
-                    print('Invalid Page: {}'.format(err))
-                    self.logFile.write('Invalid Page: {}\n'.format(err))
+                    self.logger.error('Invalid Page: {}'.format(err))
 
-                print('')
-                self.logFile.write('\n')
-
-        print('Liked: {}'.format(liked_img))
-        print('Already Liked: {}'.format(already_liked))
-        print('Inappropriate: {}'.format(inap_img))
-        print('Commented: {}'.format(commented))
-        print('Followed: {}'.format(followed))
-
-        self.logFile.write('Liked: {}\n'.format(liked_img))
-        self.logFile.write('Already Liked: {}\n'.format(already_liked))
-        self.logFile.write('Inappropriate: {}\n'.format(inap_img))
-        self.logFile.write('Commented: {}\n'.format(commented))
-        self.logFile.write('Followed: {}\n'.format(followed))
+        self.logger.info('Liked: {}'.format(liked_img))
+        self.logger.info('Already Liked: {}'.format(already_liked))
+        self.logger.info('Inappropriate: {}'.format(inap_img))
+        self.logger.info('Commented: {}'.format(commented))
+        self.logger.info('Followed: {}'.format(followed))
 
         self.followed += followed
 
@@ -694,21 +739,16 @@ class InstaPy:
         usernames = usernames or []
 
         for index, username in enumerate(usernames):
-            print('Username [{}/{}]'.format(index + 1, len(usernames)))
-            print('--> {}'.format(username.encode('utf-8')))
-            self.logFile.write(
-                'Username [{}/[]]'.format(index + 1, len(usernames)))
-            self.logFile.write('--> {}\n'.format(username.encode('utf-8')))
-            following = randint(0, 100) <= self.follow_percentage
+            self.logger.info(
+                'Username [{}/{}]'.format(index + 1, len(usernames)))
+            self.logger.info('--> {}'.format(username.encode('utf-8')))
+            following = random.randint(0, 100) <= self.follow_percentage
 
             try:
                 links = get_links_for_username(
-                    self.browser, username, amount, random, media)
+                    self.browser, username, amount, self.logger, random, media)
             except NoSuchElementException:
-                print('Element not found, skipping this username')
-                self.logFile.write(
-                    'Element not found, skipping this username\n')
-
+                self.logger.error('Element not found, skipping this username')
                 continue
 
             if (self.do_follow and
@@ -719,9 +759,10 @@ class InstaPy:
                                         self.follow_restrict,
                                         self.username,
                                         username,
-                                        self.blacklist)
+                                        self.blacklist,
+                                        self.logger)
             else:
-                print('--> Not following')
+                self.logger.info('--> Not following')
                 sleep(1)
 
             if links is False:
@@ -733,15 +774,13 @@ class InstaPy:
             for i, link in enumerate(links):
                 # Check if target has reached
                 if liked_img >= amount:
-                    print('-------------')
-                    print("--> Total liked image reached it's "
-                          "amount given: ", liked_img)
-                    print('')
+                    self.logger.info('-------------')
+                    self.logger.info("--> Total liked image reached it's "
+                                     "amount given: {}".format(liked_img))
                     break
 
-                print('Post [{}/{}]'.format(liked_img + 1, amount))
-                self.logFile.write('[{}/{}]'.format(liked_img + 1, amount))
-                self.logFile.write(link)
+                self.logger.info('Post [{}/{}]'.format(liked_img + 1, amount))
+                self.logger.info(link)
 
                 try:
                     inappropriate, user_name, is_video, reason = (
@@ -752,20 +791,22 @@ class InstaPy:
                                    self.ignore_users,
                                    self.username,
                                    self.like_by_followers_upper_limit,
-                                   self.like_by_followers_lower_limit)
+                                   self.like_by_followers_lower_limit,
+                                   self.logger)
                     )
 
                     if not inappropriate:
-                        liked = like_image(
-                            self.browser, user_name, self.blacklist
-                        )
+                        liked = like_image(self.browser,
+                                           user_name,
+                                           self.blacklist,
+                                           self.logger)
 
                         if liked:
                             total_liked_img += 1
                             liked_img += 1
                             checked_img = True
                             temp_comments = []
-                            commenting = randint(
+                            commenting = random.randint(
                                 0, 100) <= self.comment_percentage
 
                             if self.use_clarifai and (following or commenting):
@@ -774,12 +815,12 @@ class InstaPy:
                                         check_image(self.browser,
                                                     self.clarifai_api_key,
                                                     self.clarifai_img_tags,
+                                                    self.logger,
                                                     self.clarifai_full_match)
                                     )
                                 except Exception as err:
-                                    print('Image check error: {}'.format(err))
-                                    self.logFile.write(
-                                        'Image check error: {}\n'.format(err))
+                                    self.logger.error(
+                                        'Image check error: {}'.format(err))
                             if (self.do_comment and
                                 user_name not in self.dont_include and
                                 checked_img and
@@ -797,39 +838,32 @@ class InstaPy:
                                 commented += comment_image(self.browser,
                                                            user_name,
                                                            comments,
-                                                           self.blacklist)
+                                                           self.blacklist,
+                                                           self.logger)
                             else:
-                                print('--> Not commented')
+                                self.logger.info('--> Not commented')
                                 sleep(1)
 
                         else:
                             already_liked += 1
 
                     else:
-                        print('--> Image not liked: {}'.format(reason))
+                        self.logger.info(
+                            '--> Image not liked: {}'.format(reason))
                         inap_img += 1
                 except NoSuchElementException as err:
-                    print('Invalid Page: {}'.format(err))
-                    self.logFile.write('Invalid Page: {}\n'.format(err))
-
-                print('')
-                self.logFile.write('\n')
+                    self.logger.error('Invalid Page: {}'.format(err))
 
             if liked_img < amount:
-                print('-------------')
-                print("--> Given amount not fullfilled, "
-                      "image pool reached its end\n")
+                self.logger.info('-------------')
+                self.logger.info("--> Given amount not fullfilled, "
+                                 "image pool reached its end\n")
 
-        print('Liked: {}'.format(total_liked_img))
-        print('Already Liked: {}'.format(already_liked))
-        print('Inappropriate: {}'.format(inap_img))
-        print('Commented: {}'.format(commented))
-
-        self.logFile.write('Liked: {}\n'.format(total_liked_img))
-        self.logFile.write('Already Liked: {}\n'.format(already_liked))
-        self.logFile.write('Inappropriate: {}\n'.format(inap_img))
-        self.logFile.write('Commented: {}\n'.format(commented))
-
+        self.logger.info('Liked: {}'.format(total_liked_img))
+        self.logger.info('Already Liked: {}'.format(already_liked))
+        self.logger.info('Inappropriate: {}'.format(inap_img))
+        self.logger.info('Commented: {}'.format(commented))
+        
         return self
 
     def interact_by_users(self,
@@ -850,11 +884,9 @@ class InstaPy:
         usernames = usernames or []
 
         for index, username in enumerate(usernames):
-            print('Username [{}/{}]'.format(index + 1, len(usernames)))
-            print('--> {}'.format(username.encode('utf-8')))
-            self.logFile.write(
-                'Username [{}/[]]'.format(index + 1, len(usernames)))
-            self.logFile.write('--> {}\n'.format(username.encode('utf-8')))
+            self.logger.info(
+                'Username [{}/{}]'.format(index + 1, len(usernames)))
+            self.logger.info('--> {}'.format(username.encode('utf-8')))
 
             try:
                 links = get_links_for_username(self.browser,
@@ -863,9 +895,7 @@ class InstaPy:
                                                random,
                                                media)
             except NoSuchElementException:
-                print('Element not found, skipping this username')
-                self.logFile.write(
-                    'Element not found, skipping this username\n')
+                self.logger.error('Element not found, skipping this username')
                 continue
 
             if links is False:
@@ -877,15 +907,13 @@ class InstaPy:
             for i, link in enumerate(links):
                 # Check if target has reached
                 if liked_img >= amount:
-                    print('-------------')
-                    print("--> Total liked image reached it's "
-                          "amount given: ", liked_img)
-                    print('')
+                    self.logger.info('-------------')
+                    self.logger.info("--> Total liked image reached it's "
+                                     "amount given: {}".format(liked_img))
                     break
 
-                print('Post [{}/{}]'.format(liked_img + 1, amount))
-                self.logFile.write('[{}/{}]'.format(liked_img + 1, amount))
-                self.logFile.write(link)
+                self.logger.info('Post [{}/{}]'.format(liked_img + 1, amount))
+                self.logger.info(link)
 
                 try:
                     inappropriate, user_name, is_video, reason = (
@@ -896,12 +924,13 @@ class InstaPy:
                                    self.ignore_users,
                                    self.username,
                                    self.like_by_followers_upper_limit,
-                                   self.like_by_followers_lower_limit)
+                                   self.like_by_followers_lower_limit,
+                                   self.logger)
                     )
 
                     if not inappropriate:
 
-                        following = randint(0, 100) <= self.follow_percentage
+                        following = random.randint(0, 100) <= self.follow_percentage
                         if (self.do_follow and
                             username not in self.dont_include and
                             following and
@@ -913,16 +942,18 @@ class InstaPy:
                                 self.follow_restrict,
                                 self.username,
                                 username,
-                                self.blacklist)
+                                self.blacklist,
+                                self.logger)
                         else:
-                            print('--> Not following')
+                            self.logger.info('--> Not following')
                             sleep(1)
 
-                        liking = randint(0, 100) <= self.like_percentage
+                        liking = random.randint(0, 100) <= self.like_percentage
                         if self.do_like and liking:
-                            liked = like_image(
-                                self.browser, user_name, self.blacklist
-                            )
+                            liked = like_image(self.browser,
+                                               user_name,
+                                               self.blacklist,
+                                               self.logger)
                         else:
                             liked = True
 
@@ -931,7 +962,7 @@ class InstaPy:
                             liked_img += 1
                             checked_img = True
                             temp_comments = []
-                            commenting = randint(
+                            commenting = random.randint(
                                 0, 100) <= self.comment_percentage
 
                             if self.use_clarifai and (following or commenting):
@@ -940,12 +971,12 @@ class InstaPy:
                                         check_image(self.browser,
                                                     self.clarifai_api_key,
                                                     self.clarifai_img_tags,
+                                                    self.logger,
                                                     self.clarifai_full_match)
                                     )
                                 except Exception as err:
-                                    print('Image check error: {}'.format(err))
-                                    self.logFile.write(
-                                        'Image check error: {}\n'.format(err))
+                                    self.logger.error(
+                                        'Image check error: {}'.format(err))
                             if (self.do_comment and
                                 user_name not in self.dont_include and
                                 checked_img and
@@ -963,37 +994,30 @@ class InstaPy:
                                 commented += comment_image(self.browser,
                                                            user_name,
                                                            comments,
-                                                           self.blacklist)
+                                                           self.blacklist,
+                                                           self.logger)
                             else:
-                                print('--> Not commented')
+                                self.logger.info('--> Not commented')
                                 sleep(1)
                         else:
                             already_liked += 1
 
                     else:
-                        print('--> Image not liked: {}'.format(reason))
+                        self.logger.info(
+                            '--> Image not liked: {}'.format(reason))
                         inap_img += 1
                 except NoSuchElementException as err:
-                    print('Invalid Page: {}'.format(err))
-                    self.logFile.write('Invalid Page: {}\n'.format(err))
-
-                print('')
-                self.logFile.write('\n')
+                    self.logger.info('Invalid Page: {}'.format(err))
 
             if liked_img < amount:
-                print('-------------')
-                print("--> Given amount not fullfilled, image pool "
-                      "reached its end\n")
+                self.logger.info('-------------')
+                self.logger.info("--> Given amount not fullfilled, image pool "
+                                 "reached its end\n")
 
-        print('Liked: {}'.format(total_liked_img))
-        print('Already Liked: {}'.format(already_liked))
-        print('Inappropriate: {}'.format(inap_img))
-        print('Commented: {}'.format(commented))
-
-        self.logFile.write('Liked: {}\n'.format(total_liked_img))
-        self.logFile.write('Already Liked: {}\n'.format(already_liked))
-        self.logFile.write('Inappropriate: {}\n'.format(inap_img))
-        self.logFile.write('Commented: {}\n'.format(commented))
+        self.logger.info('Liked: {}'.format(total_liked_img))
+        self.logger.info('Already Liked: {}'.format(already_liked))
+        self.logger.info('Inappropriate: {}'.format(inap_img))
+        self.logger.info('Commented: {}'.format(commented))
 
         return self
 
@@ -1007,14 +1031,12 @@ class InstaPy:
                 urls = self.browser.find_elements_by_xpath(
                     "//main//article//div//div[1]//div[1]//a[1]")
                 url = urls[0].get_attribute("href")
-                print("new url ", url)
+                self.logger.info("new url {}".format(url))
             tags = get_tags(self.browser, url)
-            print(tags)
+            self.logger.info(tags)
             self.like_by_tags(tags, amount, media)
         except TypeError as err:
-            print('Sorry, an error occured: {}'.format(err))
-            self.logFile.write('Sorry, an error occured: {}\n'.format(err))
-
+            self.logger.error('Sorry, an error occured: {}'.format(err))
             self.aborting = True
             return self
 
@@ -1034,25 +1056,22 @@ class InstaPy:
                                                 self.dont_include,
                                                 self.username,
                                                 self.follow_restrict,
-                                                random)
+                                                random,
+                                                self.logger)
                 if isinstance(user, list):
                     userToInteract += user
         except (TypeError, RuntimeWarning) as err:
             if isinstance(err, RuntimeWarning):
-                print(u'Warning: {} , stopping follow_users'.format(err))
-                self.logFile.write(
-                    'Warning: {} , stopping follow_users\n'.format(err))
-
+                self.logger.warning(
+                    u'Warning: {} , stopping follow_users'.format(err))
                 return self
             else:
-                print('Sorry, an error occured: {}'.format(err))
-                self.logFile.write('Sorry, an error occured: {}\n'.format(err))
+                self.logger.error('Sorry, an error occured: {}'.format(err))
                 self.aborting = True
-
                 return self
 
-        print('--> Users: {} \n'.format(len(userToInteract)))
-        userToInteract = sample(
+        self.logger.info('--> Users: {} \n'.format(len(userToInteract)))
+        userToInteract = random.sample(
             userToInteract,
             int(ceil(self.user_interact_percentage * len(userToInteract) / 100)))
 
@@ -1077,25 +1096,23 @@ class InstaPy:
                     self.dont_include,
                     self.username,
                     self.follow_restrict,
-                    random)
+                    random,
+                    self.logger)
         except (TypeError, RuntimeWarning) as err:
             if isinstance(err, RuntimeWarning):
-                print(u'Warning: {} , stopping follow_users'.format(err))
-                self.logFile.write(
-                    'Warning: {} , stopping follow_users\n'.format(err))
-
+                self.logger.warning(
+                    u'Warning: {} , stopping follow_users'.format(err))
                 return self
             else:
-                print('Sorry, an error occured: {}'.format(err))
-                self.logFile.write('Sorry, an error occured: {}\n'.format(err))
+                self.logger.error('Sorry, an error occured: {}'.format(err))
                 self.aborting = True
-
                 return self
 
-        print('--> Users: {}'.format(len(userToInteract)))
-        print('')
-        userToInteract = sample(userToInteract, int(ceil(
+        self.logger.info('--> Users: {}'.format(len(userToInteract)))
+
+        userToInteract = random.sample(userToInteract, int(ceil(
             self.user_interact_percentage * len(userToInteract) / 100)))
+
         self.like_by_users(userToInteract,
                            self.user_interact_amount,
                            self.user_interact_random,
@@ -1124,28 +1141,24 @@ class InstaPy:
                                                             self.follow_restrict,
                                                             random,
                                                             sleep_delay,
-                                                            self.blacklist)
+                                                            self.blacklist,
+                                                            self.logger)
 
             except (TypeError, RuntimeWarning) as err:
                 if isinstance(err, RuntimeWarning):
-                    print(u'Warning: {} , skipping to next user'.format(err))
-                    self.logFile.write(
-                        'Warning: {} , skipping to next user\n'.format(err))
-
+                    self.logger.warning(
+                        u'Warning: {} , skipping to next user'.format(err))
                     continue
                 else:
-                    print('Sorry, an error occured: {}'.format(err))
-                    self.logFile.write(
-                        'Sorry, an error occured: {}\n'.format(err))
+                    self.logger.error(
+                        'Sorry, an error occured: {}'.format(err))
                     self.aborting = True
-
                     return self
-        print("--> Total people followed : {} ".format(len(userFollowed)))
+        self.logger.info("--> Total people followed : {} ".format(len(userFollowed)))
 
         if interact:
-            print('--> User followed: {}'.format(userFollowed))
-            print('')
-            userFollowed = sample(userFollowed, int(ceil(
+            self.logger.info('--> User followed: {}'.format(userFollowed))
+            userFollowed = random.sample(userFollowed, int(ceil(
                 self.user_interact_percentage * len(userFollowed) / 100)))
             self.like_by_users(userFollowed,
                                self.user_interact_amount,
@@ -1174,28 +1187,25 @@ class InstaPy:
                                                             self.follow_restrict,
                                                             random,
                                                             sleep_delay,
-                                                            self.blacklist)
+                                                            self.blacklist,
+                                                            self.logger)
 
             except (TypeError, RuntimeWarning) as err:
                 if isinstance(err, RuntimeWarning):
-                    print(u'Warning: {} , skipping to next user'.format(err))
-                    self.logFile.write(
-                        'Warning: {} , skipping to next user\n'.format(err))
-
+                    self.logger.warning(
+                        u'Warning: {} , skipping to next user'.format(err))
                     continue
                 else:
-                    print('Sorry, an error occured: {}'.format(err))
-                    self.logFile.write(
-                        'Sorry, an error occured: {}\n'.format(err))
+                    self.logger.error(
+                        'Sorry, an error occured: {}'.format(err))
                     self.aborting = True
 
                     return self
-        print("--> Total people followed : {} ".format(len(userFollowed)))
+        self.logger.info("--> Total people followed : {} ".format(len(userFollowed)))
 
         if interact:
-            print('--> User followed: {}'.format(userFollowed))
-            print('')
-            userFollowed = sample(userFollowed, int(ceil(
+            self.logger.info('--> User followed: {}'.format(userFollowed))
+            userFollowed = random.sample(userFollowed, int(ceil(
                 self.user_interact_percentage * len(userFollowed) / 100)))
             self.like_by_users(userFollowed,
                                self.user_interact_amount,
@@ -1208,9 +1218,11 @@ class InstaPy:
                        amount=10,
                        onlyInstapyFollowed=False,
                        onlyInstapyMethod='FIFO',
-                       sleep_delay=600):
+                       sleep_delay=600,
+                       onlyNotFollowMe=False):
         """Unfollows (default) 10 users from your following list"""
-        self.automatedFollowedPool = set_automated_followed_pool(self.username)
+        self.automatedFollowedPool = set_automated_followed_pool(self.username,
+                                                                 self.logger)
 
         try:
             unfollowNumber = unfollow(self.browser,
@@ -1220,21 +1232,20 @@ class InstaPy:
                                       onlyInstapyFollowed,
                                       onlyInstapyMethod,
                                       self.automatedFollowedPool,
-                                      sleep_delay)
-            print("--> Total people unfollowed : {} ".format(unfollowNumber))
+                                      sleep_delay,
+                                      onlyNotFollowMe,
+                                      self.logger)
+            self.logger.info(
+                "--> Total people unfollowed : {} ".format(unfollowNumber))
 
         except (TypeError, RuntimeWarning) as err:
             if isinstance(err, RuntimeWarning):
-                print(u'Warning: {} , stopping unfollow_users'.format(err))
-                self.logFile.write(
-                    'Warning: {} , stopping unfollow_users\n'.format(err))
-
+                self.logger.warning(
+                    u'Warning: {} , stopping unfollow_users'.format(err))
                 return self
             else:
-                print('Sorry, an error occured: {}'.format(err))
-                self.logFile.write('Sorry, an error occured: {}\n'.format(err))
+                self.logger.info('Sorry, an error occured: {}'.format(err))
                 self.aborting = True
-
                 return self
 
         return self
@@ -1263,11 +1274,10 @@ class InstaPy:
                 # Gets another load of links to be tested
                 links = get_links_from_feed(self.browser,
                                             amount,
-                                            num_of_search)
+                                            num_of_search,
+                                            self.logger)
             except NoSuchElementException:
-                print('Too few images, aborting')
-                self.logFile.write('Too few images, aborting\n')
-
+                self.logger.warning('Too few images, aborting')
                 self.aborting = True
                 return self
 
@@ -1277,20 +1287,18 @@ class InstaPy:
                 if liked_img == amount:
                     break
                 if randomize and random.choice([True, False]):
-                    print('Post Randomly Skipped...\n')
+                    self.logger.warning('Post Randomly Skipped...\n')
                     skipped_img += 1
                 else:
                     if link in history:
-                        print('This link has already '
-                              'been visited:\n', link, '\n')
+                        self.logger.info('This link has already '
+                                         'been visited:\n', link, '\n')
                     else:
-                        print('New link found...')
+                        self.logger.info('New link found...')
                         history.append(link)
-                        print('[{} posts liked /{} amount]'
-                              .format(liked_img, amount))
-                        self.logFile.write('[{}/{} links feched to be tested]'
-                                           .format(i + 1, len(links)))
-                        self.logFile.write(link)
+                        self.logger.info('[{} posts liked /{} amount]'
+                                         .format(liked_img, amount))
+                        self.logger.info(link)
 
                         try:
                             inappropriate, user_name, is_video, reason = (
@@ -1301,13 +1309,15 @@ class InstaPy:
                                            self.ignore_users,
                                            self.username,
                                            self.like_by_followers_upper_limit,
-                                           self.like_by_followers_lower_limit)
+                                           self.like_by_followers_lower_limit,
+                                           self.logger)
                             )
 
                             if not inappropriate:
-                                liked = like_image(
-                                    self.browser, user_name, self.blacklist
-                                )
+                                liked = like_image(self.browser,
+                                                   user_name,
+                                                   self.blacklist,
+                                                   self.logger)
 
                                 if liked:
                                     username = (self.browser.
@@ -1320,8 +1330,9 @@ class InstaPy:
                                     name.append(username)
 
                                     if interact:
-                                        print('--> User followed: {}'.format(
-                                            name))
+                                        self.logger.info(
+                                            '--> User followed: {}'
+                                            .format(name))
                                         self.like_by_users(
                                             name,
                                             self.user_interact_amount,
@@ -1331,9 +1342,9 @@ class InstaPy:
                                     liked_img += 1
                                     checked_img = True
                                     temp_comments = []
-                                    commenting = randint(
+                                    commenting = random.randint(
                                         0, 100) <= self.comment_percentage
-                                    following = randint(
+                                    following = random.randint(
                                         0, 100) <= self.follow_percentage
 
                                     if (self.use_clarifai and
@@ -1344,14 +1355,13 @@ class InstaPy:
                                                     self.browser,
                                                     self.clarifai_api_key,
                                                     self.clarifai_img_tags,
+                                                    self.logger,
                                                     self.clarifai_full_match)
                                             )
                                         except Exception as err:
-                                            print('Image check error:'
-                                                  ' {}'.format(err))
-                                            self.logFile.write(
-                                                'Image check error: '
-                                                '{}\n'.format(err))
+                                            self.logger.error(
+                                                'Image check error:'
+                                                ' {}'.format(err))
 
                                     if (self.do_comment and
                                         user_name not in self.dont_include and
@@ -1372,9 +1382,10 @@ class InstaPy:
                                                         self.browser,
                                                         user_name,
                                                         comments,
-                                                        self.blacklist)
+                                                        self.blacklist,
+                                                        self.logger)
                                     else:
-                                        print('--> Not commented')
+                                        self.logger.info('--> Not commented')
                                         sleep(1)
 
                                     if (self.do_follow and
@@ -1388,37 +1399,28 @@ class InstaPy:
                                             self.follow_restrict,
                                             self.username,
                                             user_name,
-                                            self.blacklist)
+                                            self.blacklist,
+                                            self.logger)
                                     else:
-                                        print('--> Not following')
+                                        self.logger.info('--> Not following')
                                         sleep(1)
                                 else:
                                     already_liked += 1
                             else:
-                                print('--> Image not liked: {}'.format(reason))
+                                self.logger.info(
+                                    '--> Image not liked: {}'.format(reason))
                                 inap_img += 1
                                 if reason == 'Inappropriate':
-                                    unfollow_user(self.browser)
+                                    unfollow_user(self.browser, self.logger)
                         except NoSuchElementException as err:
-                            print('Invalid Page: {}'.format(err))
-                            self.logFile.write(
-                                'Invalid Page: {}\n'.format(err))
-
-                        print('')
-                        self.logFile.write('\n')
-
-        print('Liked: {}'.format(liked_img))
-        print('Already Liked: {}'.format(already_liked))
-        print('Inappropriate: {}'.format(inap_img))
-        print('Commented: {}'.format(commented))
-        print('Followed: {}'.format(followed))
-        print('Randomly Skipped: {}'.format(skipped_img))
-
-        self.logFile.write('Liked: {}\n'.format(liked_img))
-        self.logFile.write('Already Liked: {}\n'.format(already_liked))
-        self.logFile.write('Inappropriate: {}\n'.format(inap_img))
-        self.logFile.write('Commented: {}\n'.format(commented))
-        self.logFile.write('Followed: {}\n'.format(followed))
+                            self.logger.error('Invalid Page: {}'.format(err))
+                            
+        self.logger.info('Liked: {}'.format(liked_img))
+        self.logger.info('Already Liked: {}'.format(already_liked))
+        self.logger.info('Inappropriate: {}'.format(inap_img))
+        self.logger.info('Commented: {}'.format(commented))
+        self.logger.info('Followed: {}'.format(followed))
+        self.logger.info('Randomly Skipped: {}'.format(skipped_img))
 
         self.followed += followed
 
@@ -1433,7 +1435,10 @@ class InstaPy:
             return
 
         # list of users who liked our media
-        active_users = get_active_users(self.browser, self.username, posts)
+        active_users = get_active_users(self.browser,
+                                        self.username,
+                                        posts,
+                                        self.logger)
 
         for user in active_users:
             # include active user to not unfollow list
@@ -1456,8 +1461,7 @@ class InstaPy:
                     if row['campaign'] == campaign:
                         self.dont_include.append(row['username'])
         except:
-            print('Campaign {} first run'.format(campaign))
-            self.logFile.write('Campaign {} first run'.format(campaign))
+            self.logger.info('Campaign {} first run'.format(campaign))
 
     def end(self):
         """Closes the current session"""
@@ -1468,17 +1472,9 @@ class InstaPy:
         if self.nogui:
             self.display.stop()
 
-        print('')
-        print('Session ended')
-        print('-------------')
-
-        self.logFile.write(
-            '\nSession ended - {}\n'.format(
-                datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            )
-        )
-        self.logFile.write('-' * 20 + '\n\n')
-        self.logFile.close()
+        self.logger.info('Session ended - {}'.format(
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+        self.logger.info('-' * 20 + '\n\n')
 
         with open('./logs/followed.txt', 'w') as followFile:
             followFile.write(str(self.followed))
